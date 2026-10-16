@@ -1,0 +1,34 @@
+services:
+  gcs:
+    image: fsouza/fake-gcs-server:1.56.1
+    command: ["-scheme", "http", "-port", "4443"]
+    ports:
+      - "4443:4443"
+
+  create-bucket:
+    image: curlimages/curl:8.16.0
+    command: ["-sf", "-X", "POST", "-H", "Content-Type: application/json",
+              "-d", '{"name": "videos"}', "http://gcs:4443/storage/v1/b?project=local-dev"]
+    depends_on:
+      - gcs
+    restart: on-failure
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      GCS_BUCKET: videos
+      GCS_PROJECT: local-dev
+      GCS_ENDPOINT: http://gcs:4443
+      GCS_PUBLIC_ENDPOINT: http://localhost:4443
+      DATABASE_URL: sqlite:////data/uploads.db
+      ALLOWED_ORIGIN: http://localhost:8000
+    volumes:
+      - db:/data
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+
+volumes:
+  db:
