@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GCS video upload demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+    progress, video { width: 100%; }
+    video { margin-top: 1rem; background: #000; }
+  </style>
+</head>
+<body>
+  <h1>GCS video upload demo</h1>
+  <p>Pick a video. It goes straight to the bucket; the API never sees the bytes.</p>
+  <input id="file" type="file" accept="video/*">
+  <button id="upload">Upload</button>
+  <p><progress id="progress" value="0" max="1"></progress></p>
+  <p id="status">Waiting for a file.</p>
+  <video id="player" controls hidden></video>
+
+  <script>
+    const MAX_ATTEMPTS = 3;
+    const POLL_INTERVAL_MS = 1000;
+    const POLL_LIMIT = 60;
+
+    const statusEl = document.getElementById("status");
+    const progressEl = document.getElementById("progress");
+    const player = document.getElementById("player");
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    // 1. Ask the API for a resumable upload session.
+    async function startUpload(file) {
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          content_type: file.type,
+          size_bytes: file.size,
+        }),
+      });
+      if (!response.ok) throw new Error(`Start failed: ${response.status}`);
+      return response.json();
+    }
+
+    // 2. Send the whole file to the session URL in one PUT.
+    // XMLHttpRequest rather than fetch because it reports upload progress.
+    function putOnce(url, file) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url);
+        xhr.setRequestHeader("Content-Type", file.type);
+        xhr.upload.onprogress = (event) => { progressEl.value = event.loaded / file.size; };
+        xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(`PUT failed: ${xhr.status}`)));
+        xhr.onerror = () => reject(new Error("PUT failed: network error"));
+        xhr.send(file);
+      });
+    }
+
+    async function putWithRetry(url, file) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await putOnce(url, file);
+        } catch (error) {
+          if (attempt === MAX_ATTEMPTS) throw error;
+          setStatus(`${error.message}; retrying from the start (attempt ${attempt + 1})`);
+          await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+        }
+      }
+    }
+
+    // 3. Poll until the API has confirmed the object exists in the bucket.
+    async function waitUntilReady(id) {
+      for (let i = 0; i < POLL_LIMIT; i++) {
+        const response = await fetch(`/api/uploads/${id}`);
+        const upload = await response.json();
+        if (upload.status === "ready") return;
+        if (upload.status === "failed") throw new Error("The upload failed verification.");
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      }
+      throw new Error("Timed out waiting for the upload to be confirmed.");
+    }
+
+    document.getElementById("upload").addEventListener("click", async () => {
+      const file = document.getElementById("file").files[0];
+      if (!file) return setStatus("Choose a video first.");
+      try {
+        setStatus("Starting upload...");
+        const { id, upload_url } = await startUpload(file);
+        setStatus("Uploading to storage...");
+        await putWithRetry(upload_url, file);
+        setStatus("Confirming...");
+        await waitUntilReady(id);
+        // 4. Play it. The media endpoint redirects to a short-lived signed URL.
+        player.src = `/api/media/${id}`;
+        player.hidden = false;
+        setStatus("Ready.");
+      } catch (error) {
+        setStatus(error.message);
+      }
+    });
+  </script>
+</body>
+</html>
